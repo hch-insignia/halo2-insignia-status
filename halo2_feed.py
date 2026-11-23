@@ -1,4 +1,4 @@
-"""Halo Classic Hub status board. --dry-run never contacts Discord."""
+"""Halo Classic Hub status feed: new posts on displayed changes. --dry-run is read-only."""
 import argparse
 import hashlib
 import json
@@ -59,18 +59,25 @@ def parse_in_game(soup):
         raise SourceError("Active-games columns changed")
     rows = cells[3].select("tr[title]")
     values = []
+    session_rows = 0
     for row in rows:
         title = BeautifulSoup(row["title"], "html.parser").get_text(" ", strip=True).lower()
-        if not any(term in title for term in ("public matches", "private matches", "in-game")):
+        if title.startswith(("public matches", "private matches")):
+            session_rows += 1
+            continue
+        if title != "players currently in-game":
             raise SourceError("Unrecognized active-player category")
         parts = row.find_all("td", recursive=False)
         if len(parts) != 2:
             raise SourceError("Active-player layout changed")
-        # Public matches may be shown as occupied / available. Count occupied only.
-        values.append(count(parts[1].get_text(" ", strip=True).split("/")[0]))
-    if not values:
-        raise SourceError("Missing in-game count")
-    return sum(values)
+        values.append(count(parts[1].get_text(" ", strip=True)))
+    if len(values) == 1:
+        return values[0]
+    # The current page omits the gamepad row at zero. Require the known
+    # session-table structure so a missing/broken table does not become zero.
+    if not values and session_rows:
+        return 0
+    raise SourceError("Missing or duplicate in-game counter")
 
 
 def parse_weekly(soup):
@@ -263,21 +270,117 @@ def discord_request(session, method, url, body):
     raise DiscordError(429)
 
 
+def delete_old_messages(session, base, state, path):
+    """Retry saved deletions without posting another status or deleting the latest."""
+    pending = list(dict.fromkeys(str(v) for v in state.get("pending_delete", [])))
+    if not pending:
+        return
+    state["pending_delete"] = pending
+    for message_id in pending.copy():
+        if message_id == str(state.get("message_id")) or not message_id.isdigit():
+            state["pending_delete"].remove(message_id)
+            save_state(path, state)
+            continue
+        try:
+            discord_request(session, "DELETE", f"{base}/messages/{message_id}", None)
+        except DiscordError as error:
+            if error.code != 10008:  # Already deleted is success; other failures retry.
+                LOG.warning("Old-status cleanup pending: %s", error)
+                continue
+        state["pending_delete"].remove(message_id)
+        save_state(path, state)
+        LOG.info("Removed previous status message_id=%s", message_id)
+
+
+def cleanup_history(webhook_session, bot_session, base, state, path):
+    """Scan one history page per poll; delete ONLY posts by this exact webhook.
+
+    The bot only reads IDs. Deletion uses the webhook's own token, so it cannot
+    delete member messages or posts by a different webhook. No content intent
+    or Manage Messages permission is needed.
+    """
+    if bot_session is None or not state.get("message_id"):
+        return
+    if state.get("history_cleanup_complete"):
+        if datetime.now(UTC).timestamp() < state.get("history_next_scan", 0):
+            return
+        # Repeat hourly to catch orphaned posts after ambiguous network replies.
+        state.pop("history_before", None)
+        state["history_cleanup_complete"] = False
+    if not state.get("history_before"):
+        state["history_before"] = str(state["message_id"])
+        save_state(path, state)
+    meta = discord_request(webhook_session, "GET", base, None)
+    expected_id = urlsplit(base).path.split("/")[-2]
+    if not isinstance(meta, dict) or str(meta.get("id")) != expected_id or not str(meta.get("channel_id", "")).isdigit():
+        raise DiscordError("webhook metadata not recognized")
+    channel_id = meta["channel_id"]
+    # A history request can return an empty list without READ_MESSAGE_HISTORY.
+    # Verify access to our known live message before accepting end-of-history.
+    latest = discord_request(bot_session, "GET",
+        f"https://discord.com/api/v10/channels/{channel_id}/messages/{state['message_id']}", None)
+    if not isinstance(latest, dict) or str(latest.get("id")) != str(state["message_id"]):
+        raise DiscordError("bot cannot read latest status message")
+    cursor = state["history_before"]
+    if not str(cursor).isdigit():
+        raise ValueError("Invalid saved history cursor")
+    messages = discord_request(bot_session, "GET",
+        f"https://discord.com/api/v10/channels/{channel_id}/messages?limit=100&before={cursor}", None)
+    if not isinstance(messages, list):
+        raise DiscordError("channel history not recognized")
+    ids = []
+    pending = list(state.get("pending_delete", []))
+    for message in messages:
+        message_id = str(message.get("id", ""))
+        if not message_id.isdigit() or int(message_id) >= int(cursor):
+            raise DiscordError("invalid history pagination")
+        ids.append(message_id)
+        if str(message.get("webhook_id")) == expected_id and message_id != str(state["message_id"]):
+            pending.append(message_id)
+    # Persist deletion targets before advancing the cursor. Failed deletes
+    # remain queued through restarts, even when the history scan is complete.
+    state["pending_delete"] = list(dict.fromkeys(pending))
+    if ids:
+        state["history_before"] = min(ids, key=int)
+    if len(messages) < 100:
+        state["history_cleanup_complete"] = True
+        state["history_next_scan"] = datetime.now(UTC).timestamp() + 3600
+    save_state(path, state)
+    delete_old_messages(webhook_session, base, state, path)
+    LOG.info("History scan: checked %s messages; pending deletes=%s; scan complete=%s",
+             len(messages), len(state["pending_delete"]), state.get("history_cleanup_complete", False))
+
+
 def update_board(session, base, body, state, path):
+    # Ignore the check timestamp. Changes outside the displayed top five do not
+    # trigger an identical-looking alert. Persist the last successful post so
+    # an unchanged restart does not send another notification.
+    signature = hashlib.sha256(json.dumps(
+        [{k: v for k, v in embed.items() if k != "timestamp"}
+         for embed in body.get("embeds", [])],
+        sort_keys=True, ensure_ascii=False,
+    ).encode()).hexdigest()
     message_id = state.get("message_id")
-    if message_id:
+    if message_id and state.get("last_post_signature") == signature:
         try:
             discord_request(session, "PATCH", f"{base}/messages/{message_id}", body)
-            return
+            delete_old_messages(session, base, state, path)
+            return False
         except DiscordError as error:
             if error.code != 10008:  # Recreate only when Discord says Unknown Message.
                 raise
+            message_id = None
     result = discord_request(session, "POST", base + "?wait=true", body)
     if not str(result.get("id", "")).isdigit():
         raise DiscordError("missing message ID")
     state["message_id"] = result["id"]
+    state["last_post_signature"] = signature
+    if message_id and str(message_id) != str(result["id"]):
+        state.setdefault("pending_delete", []).append(str(message_id))
     save_state(path, state)
-    LOG.info("Created status message. DISCORD_MESSAGE_ID=%s", state["message_id"])
+    LOG.info("Posted status update; message_id=%s", state["message_id"])
+    delete_old_messages(session, base, state, path)
+    return True
 
 
 def main():
@@ -291,7 +394,7 @@ def main():
     zone = ZoneInfo(os.getenv("DISPLAY_TIMEZONE", "America/New_York"))
     interval = max(60, int(os.getenv("POLL_SECONDS", "60")))
     source = requests.Session()
-    source.headers["User-Agent"] = "HaloClassicHub-Status/2.0 (public status; 60s minimum polling)"
+    source.headers["User-Agent"] = "HaloClassicHub-Status/2.3 (public status; 60s minimum polling)"
     if args.dry_run:
         if args.fixtures:
             home, halo = [BeautifulSoup((args.fixtures / f"{name}.html").read_text(), "html.parser") for name in ("home", "halo2")]
@@ -315,9 +418,16 @@ def main():
     # Validate state storage before the first external post.
     save_state(path, state)
     discord = requests.Session()
+    bot_token = os.getenv("DISCORD_BOT_TOKEN", "").strip()
+    history_session = None
+    if bot_token:
+        history_session = requests.Session()
+        history_session.headers["Authorization"] = "Bot " + bot_token
+    else:
+        LOG.info("Previous tracked posts will be removed; add DISCORD_BOT_TOKEN for older untracked history cleanup")
     for name in (signal.SIGTERM, signal.SIGINT):
         signal.signal(name, lambda *_: STOP.set())
-    LOG.info("Starting Halo 2 board; refresh every %ss; timezone %s", interval, zone)
+    LOG.info("Starting Halo 2 feed; new posts on displayed changes; check every %ss; timezone %s", interval, zone)
     while not STOP.is_set():
         home, halo = fetch_soup(source, HOME), fetch_soup(source, HALO)
         now = datetime.now(UTC)
@@ -325,8 +435,12 @@ def main():
         if STOP.is_set():
             break
         try:
-            update_board(discord, base, payload(data, now), state, path)
-            LOG.info("Status updated; Halo 2 online=%s in_game=%s weekly=%s", data["online"], data["in_game"], data["weekly"])
+            posted = update_board(discord, base, payload(data, now), state, path)
+            LOG.info("%s; Halo 2 online=%s in_game=%s weekly=%s", "New status posted" if posted else "No displayed changes; checked time refreshed", data["online"], data["in_game"], data["weekly"])
+            try:
+                cleanup_history(discord, history_session, base, state, path)
+            except DiscordError as error:
+                LOG.warning("History cleanup will retry; check bot token and View Channel / Read Message History permissions: %s", error)
         except DiscordError as error:
             LOG.error("%s", error)
             if error.status in (401, 403) or error.code in (10015, 50027):
