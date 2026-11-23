@@ -1,0 +1,4 @@
+Validated November 23, 2026.
+Live read-only dry run: all requested fields parsed successfully from insignia.live and insignia.live/halo2.
+Offline tests: 11 passed, including top-five playlist ordering, occupied-slot totals, zero vs unavailable, timezone/day rollover, DST, saved-message updates, missing-message recreation, and Discord rate-limit handling.
+No real Discord request, GitHub account/repository creation, Railway deployment, or Docker build performed.
